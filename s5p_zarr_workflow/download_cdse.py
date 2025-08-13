@@ -18,7 +18,7 @@ start_date=os.getenv("start_date")
 product_Type=os.getenv("productType")
 
 startdate = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
-enddate = startdate + relativedelta(months=1)
+enddate = startdate + relativedelta(days=1)
 
 def download():
     features = query_features(

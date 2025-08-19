@@ -88,9 +88,20 @@ def merge_mean_by_time(datasets):
     return ds_out
 
 
-def reproject_CO(path):
+def reproject(path, qa_threshold = 0.5, is_no2 = False):
 
     ds = xr.open_dataset(path, engine="netcdf4", group = "PRODUCT")
+
+    if is_no2:
+        layers = ds["averaging_kernel"].coords["layer"].values
+
+        avg_kernel = xr.Dataset({
+            f"var_layer_{int(l)}": ds["averaging_kernel"].sel(layer=l).drop_vars("layer")
+            for l in layers
+        })
+
+        additional_data = ds[["vertices", "layer", "tm5_constant_a", "tm5_constant_b"]]
+        ds = ds.drop_vars(["vertices", "layer", "tm5_constant_a", "tm5_constant_b", "averaging_kernel"])
 
     transformer = Transformer.from_crs("EPSG:27704", "EPSG:4326", always_xy=True)
     x,y = 5700000, 2100000
@@ -108,8 +119,12 @@ def reproject_CO(path):
     mask = (
     (ds["latitude"] >= lat_min) & (ds["latitude"] <= lat_max) &
     (ds["longitude"] >= lon_min) & (ds["longitude"] <= lon_max) & 
-    (ds["qa_value"] >= 0.5)
+    (ds["qa_value"] >= qa_threshold)
     )
+
+    if is_no2:
+        avg_kernel_subset = avg_kernel.where(mask, drop=True)
+        avg_kernel_subset = avg_kernel_subset.rio.write_crs("EPSG:4326", inplace=False)
 
     ds_subset = ds.where(mask, drop=True) 
 
@@ -134,22 +149,58 @@ def reproject_CO(path):
 
     gridded_data = {}
 
+    if is_no2:
+        gridded_avg_kernel = {}
+
+        for var in avg_kernel_subset.data_vars:
+            gridded = griddata((lon_original.values.flatten(), lat_original.values.flatten()),
+                                            avg_kernel_subset[var].values.flatten(),
+                                            (lon_grid_full, lat_grid_full),
+                                            method="linear")
+
+            gridded_avg_kernel[var] = gridded
+
     for var in ds_band.data_vars:
-        gridded = griddata((lon_original.values.flatten(), lat_original.values.flatten()),
+        if var == "qa_value":
+            gridded = griddata((lon_original.values.flatten(), lat_original.values.flatten()),
                                         ds_band[var].values.flatten(),
                                         (lon_grid_full, lat_grid_full),
-                                        method="linear")
+                                        method="nearest")
+            
+        else:
+            gridded = griddata((lon_original.values.flatten(), lat_original.values.flatten()),
+                                            ds_band[var].values.flatten(),
+                                            (lon_grid_full, lat_grid_full),
+                                            method="linear")
 
         gridded_data[var] = gridded
 
     reprojected = {}
 
+    if is_no2:
+        reprojected_avg_kernel = {}
+
+        for var in gridded_avg_kernel:
+            arr_avg_10km, tr_avg_1km, crs_avg_1km = reproject_numpy_to_equi7_eu_1km(
+                gridded_avg_kernel[var], target_lon_full, target_lat_full,
+                nodata=np.nan,
+                resampling="bilinear"          
+            )
+            reprojected_avg_kernel[var] = (("y", "x"),arr_avg_10km)
+
     for var in gridded_data:
-        arr_10km, tr_1km, crs_1km = reproject_numpy_to_equi7_eu_1km(
-            gridded_data[var], target_lon_full, target_lat_full,
-            nodata=np.nan,                 # or np.nan for floats
-            resampling="bilinear"          # use "nearest" for labels; "bilinear"/"cubic" for continuous
-        )
+        if var == "qa_value":
+            arr_10km, tr_1km, crs_1km = reproject_numpy_to_equi7_eu_1km(
+                gridded_data[var], target_lon_full, target_lat_full,
+                nodata=np.nan,
+                resampling="nearest"          
+            )
+        else:
+            arr_10km, tr_1km, crs_1km = reproject_numpy_to_equi7_eu_1km(
+                gridded_data[var], target_lon_full, target_lat_full,
+                nodata=np.nan,
+                resampling="bilinear"          
+            )
 
         reprojected[var] = (("y", "x"),arr_10km)
 
@@ -163,6 +214,21 @@ def reproject_CO(path):
                               "y":("y", ys),
                               })
     
-    ds_aut = ds_equi7.sel(x=slice(4500000,5390000), y=slice(1790000,1200000)).expand_dims({"time": [sensing_time]})
+    if is_no2:
+        ds_avg_kernel_equi7 =  xr.Dataset(reprojected_avg_kernel,
+                        coords={
+                                "x":("x", xs),
+                                "y":("y", ys),
+                                })
+        slices = [ds_avg_kernel_equi7[f"var_layer_{int(i)}"] for i in layers]
+
+        var3d = xr.concat(slices, dim="layers").assign_coords(layers=layers)
+
+        var3d = var3d.transpose("y", "x", "layers")
+
+        ds_merged = ds_avg_kernel_equi7.assign(averaging_kernel=var3d)
+        ds_equi7 = xr.merge([ds_equi7, ds_merged["averaging_kernel"], additional_data], join="exact")
+    
+    ds_aut = ds_equi7.sel(x=slice(4500000,5390000), y=slice(1800000,1210000)).expand_dims({"time": [sensing_time]})
 
     return ds_aut
